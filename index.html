@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Neuron Brain</title>
+<style>
+  :root { color-scheme: dark; --bg: #0b0d12; --panel: #141821; --line: #2a3140; --text: #d8dee9; --dim: #6b7385;
+          --clean: #5aa9ff; --inj: #ff9b42; --up: #3ddc84; --down: #ff5470; }
+  body { margin: 0; font: 14px/1.45 ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  main { max-width: 1400px; margin: auto; padding: 20px; display: grid; gap: 12px; }
+  h1 { margin: 0; font-size: 20px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  textarea, input, button { font: inherit; color: inherit; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px; }
+  textarea { width: 100%; min-height: 56px; box-sizing: border-box; resize: vertical; }
+  button { cursor: pointer; }
+  button.on { border-color: var(--text); }
+  button:disabled { opacity: .4; cursor: default; }
+  .outs { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+  .out { background: var(--panel); padding: 10px; border-radius: 6px; white-space: pre-wrap; min-height: 40px; border-left: 3px solid var(--c); }
+  #tokens span { cursor: pointer; padding: 1px 4px; margin: 1px; border-radius: 4px; background: var(--panel); white-space: pre; display: inline-block; font: 12px ui-monospace, monospace; }
+  #tokens span.sel { outline: 1px solid var(--text); }
+  svg { width: 100%; height: auto; background: var(--panel); border-radius: 6px; }
+  .dim { color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Neuron Brain <span id="model" class="dim" style="font-size:13px"></span></h1>
+  <textarea id="prompt">Write one sentence about breakfast.</textarea>
+  <div class="row">
+    <label>inject <input id="concept" placeholder="concept, e.g. thunderstorms" value="thunderstorms" size="22"></label>
+    <label>after layer <input id="layer" type="number" min="0" value="8" style="width:56px"></label>
+    <label>strength <input id="strength" type="range" min="0" max="2" step="0.05" value="0.5"> <span id="sv">0.5</span>×</label>
+    <button id="go">Run</button>
+    <span id="status" class="dim"></span>
+  </div>
+  <div class="outs">
+    <div><div class="dim">clean output</div><div id="clean_text" class="out" style="--c:var(--clean)"></div></div>
+    <div><div class="dim">injected output</div><div id="injected_text" class="out" style="--c:var(--inj)"></div></div>
+  </div>
+  <div class="row">
+    <span class="dim">view</span>
+    <button data-mode="clean">clean</button><button data-mode="injected">injected</button><button data-mode="diff">diff</button>
+    <span class="dim">· click a token to see its neurons (default: last token, where the reply starts)</span>
+  </div>
+  <div id="tokens"></div>
+  <svg id="brain" viewBox="0 0 100 10"></svg>
+  <p class="dim" style="margin:0">
+    Columns are layers, input on the left and output on the right. Dots are the 8 strongest MLP neurons in that layer
+    for the selected token: bigger means stronger, faint means negative. Lines show how much a neuron writes into what a
+    next-layer neuron reads. The white arrow is the strongest chain. Injected view: a white ring marks a neuron that was
+    not in the clean top 8. Diff view: green neurons were pushed up by the injection, red ones pushed down.
+  </p>
+</main>
+<script type="module">
+const $ = (s) => document.querySelector(s);
+const NS = "http://www.w3.org/2000/svg";
+let data = null, tok = 0, mode = "clean";
+
+// Two engines, same contract: lab.py on this machine (POST /run), or the model in this browser tab (WebGPU).
+const local = await fetch("info").then((r) => r.ok).catch(() => false);
+let engine = null;
+async function getEngine() {
+  if (engine) return engine;
+  if (local && !location.search.includes("browser")) {
+    engine = { run: (req) => fetch("run", { method: "POST", body: JSON.stringify(req) }).then((r) => r.json()) };
+  } else {
+    const m = await import("./web/engine.js");
+    const info = await m.load((msg) => ($("#status").textContent = msg));
+    $("#model").textContent = `${info.model} · running in your browser`;
+    engine = m;
+  }
+  return engine;
+}
+if (!local) $("#status").textContent = "The model runs on your GPU: about 1.4 GB, downloaded once on your first Run.";
+
+$("#strength").oninput = (e) => ($("#sv").textContent = e.target.value);
+document.querySelectorAll("[data-mode]").forEach((b) => (b.onclick = () => { mode = b.dataset.mode; render(); }));
+
+$("#go").onclick = async () => {
+  $("#status").textContent = engine || local ? "running…" : "loading…";
+  $("#go").disabled = true;
+  try {
+    const d = await (await getEngine()).run({
+      prompt: $("#prompt").value, concept: $("#concept").value,
+      layer: +$("#layer").value, strength: +$("#strength").value });
+    if (d.error) throw new Error(d.error);
+    data = d;
+    tok = d.tokens.length - 1;
+    if (!d.injected) mode = "clean";
+    $("#model").textContent = d.model;
+    $("#layer").max = d.n_layers - 1;
+    $("#clean_text").textContent = d.clean_text;
+    $("#injected_text").textContent = d.injected_text ?? "(nothing injected)";
+    $("#status").textContent = "";
+    render();
+  } catch (e) {
+    $("#status").textContent = e.message;
+  }
+  $("#go").disabled = false;
+};
+
+function render() {
+  document.querySelectorAll("[data-mode]").forEach((b) => {
+    b.classList.toggle("on", b.dataset.mode === mode);
+    b.disabled = !data?.[b.dataset.mode];
+  });
+  $("#tokens").replaceChildren(...data.tokens.map((t, i) => {
+    const s = document.createElement("span");
+    s.textContent = t.replace(/\n/g, "⏎");
+    s.className = i === tok ? "sel" : "";
+    s.onclick = () => { tok = i; render(); };
+    return s;
+  }));
+  draw();
+}
+
+function el(tag, attrs, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  parent.append(e);
+  return e;
+}
+
+function draw() {
+  const svg = $("#brain"), nodes = data[mode].nodes[tok], edges = data[mode].edges?.[tok] ?? data[mode].edgesFor(tok);
+  const n = data.n_layers, K = nodes[0].length, W = 46, H = 48, X0 = 30, Y0 = 40;
+  const x = (L) => X0 + L * W, y = (r) => Y0 + r * H;
+  const alive = (v) => Math.abs(v) > 1e-3; // diff view: layers before the injection did not change
+  const color = (v) => mode === "diff" ? (v > 0 ? "var(--up)" : "var(--down)") : mode === "clean" ? "var(--clean)" : "var(--inj)";
+  svg.setAttribute("viewBox", `0 0 ${2 * X0 + (n - 1) * W} ${Y0 + K * H}`);
+  svg.replaceChildren();
+  el("defs", {}, svg).innerHTML =
+    '<marker id="tip" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="white"/></marker>';
+
+  for (let L = 0; L < n; L++)
+    el("text", { x: x(L), y: 16, "text-anchor": "middle", fill: "var(--dim)", "font-size": 10 }, svg).textContent = L;
+  if (mode !== "clean") {
+    const ix = x(data.layer) + W / 2;
+    el("line", { x1: ix, x2: ix, y1: 22, y2: Y0 + K * H - 14, stroke: "var(--inj)", "stroke-dasharray": "4 4" }, svg);
+    el("text", { x: ix, y: Y0 + K * H - 2, "text-anchor": "middle", fill: "var(--inj)", "font-size": 10 }, svg).textContent = "injection";
+  }
+
+  for (let L = 0; L < n - 1; L++) {
+    const max = Math.max(...edges[L].flat().map(Math.abs)) || 1;
+    edges[L].forEach((row, a) => row.forEach((w, b) => {
+      const s = Math.abs(w) / max;
+      if (s < 0.15 || !alive(nodes[L][a][1]) || !alive(nodes[L + 1][b][1])) return;
+      el("line", { x1: x(L), y1: y(a), x2: x(L + 1), y2: y(b), stroke: w > 0 ? "#8fa3c8" : "#c87f8f",
+                   "stroke-width": 3 * s, opacity: 0.2 + 0.5 * s }, svg);
+    }));
+  }
+
+  // strongest chain: start at the first live layer's top neuron, follow the heaviest edge forward
+  let L = nodes.findIndex((col) => alive(col[0][1]));
+  if (L >= 0) {
+    let r = 0;
+    const pts = [[x(L), y(r)]];
+    for (; L < n - 1; L++) {
+      const row = edges[L][r];
+      r = row.reduce((best, w, b) => (Math.abs(w) > Math.abs(row[best]) ? b : best), 0);
+      pts.push([x(L + 1), y(r)]);
+    }
+    el("polyline", { points: pts.join(" "), fill: "none", stroke: "white", "stroke-width": 2.5, opacity: 0.85, "marker-end": "url(#tip)" }, svg);
+  }
+
+  const cleanNodes = data.clean.nodes[tok];
+  nodes.forEach((col, L) => {
+    const max = Math.abs(col[0][1]) || 1;
+    col.forEach(([idx, v], r) => {
+      if (!alive(v)) return;
+      const c = el("circle", { cx: x(L), cy: y(r), r: 3 + 10 * Math.abs(v) / max, fill: color(v),
+                               "fill-opacity": v < 0 && mode !== "diff" ? 0.3 : 0.9 }, svg);
+      if (mode === "injected" && !cleanNodes[L].some(([i]) => i === idx)) {
+        c.setAttribute("stroke", "white");
+        c.setAttribute("stroke-width", 2);
+      }
+      el("title", {}, c).textContent = `layer ${L} · neuron #${idx} · ${mode === "diff" ? "change" : "activation"} ${v.toFixed(3)}`;
+      el("text", { x: x(L), y: y(r) + 23, "text-anchor": "middle", fill: "var(--dim)", "font-size": 8 }, svg).textContent = idx;
+    });
+  });
+}
+</script>
+</body>
+</html>
